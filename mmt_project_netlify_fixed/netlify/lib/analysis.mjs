@@ -3,7 +3,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 const apiKey = process.env.GEMINI_API_KEY;
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
-const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'];
+const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
 
 const destinationAnalysisSchema = {
   type: Type.OBJECT,
@@ -163,77 +163,86 @@ function heuristicFromText(textHint = '') {
   };
 }
 
-async function analyzeYouTubeWithInteractions(videoUrl, prompt) {
-  if (!apiKey) return { raw: null, error: 'Missing GEMINI_API_KEY' };
+async function analyzeYouTubeDirect(videoUrl, prompt) {
+  if (!ai) return { raw: null, error: 'Missing GEMINI_API_KEY' };
 
-  const controller = new AbortController();
-  // YouTube video understanding can take longer than a normal text request.
-  // Netlify synchronous functions allow up to 60s, so give Gemini 50s.
-  const timer = setTimeout(() => controller.abort(), 50000);
-
-  try {
-    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify({
-        model: 'gemini-3.8-flash',
-        store: false,
-        input: [
-          { type: 'video', uri: videoUrl },
-          { type: 'text', text: prompt },
+  const errors = [];
+  for (const model of CANDIDATE_MODELS) {
+    try {
+      const work = ai.models.generateContent({
+        model,
+        contents: [
+          { fileData: { fileUri: videoUrl } },
+          { text: prompt },
         ],
-        response_format: {
-          type: 'text',
-          mime_type: 'application/json',
-          schema: destinationAnalysisJsonSchema,
-        },
-      }),
-    });
+        // Keep the YouTube request deliberately simple. Structured schemas can
+        // make preview video URL calls more brittle; the prompt already asks for JSON.
+        config: { responseMimeType: 'application/json' },
+      });
 
-    const responseText = await res.text();
-    if (!res.ok) {
-      console.error('Gemini Interactions YouTube error', res.status, responseText.slice(0, 2000));
-      return { raw: null, error: `Gemini Interactions API ${res.status}: ${responseText.slice(0, 500)}` };
-    }
+      const response = await Promise.race([
+        work,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('YouTube video analysis timeout')), 48000)),
+      ]);
 
-    let data;
-    try { data = JSON.parse(responseText); }
-    catch {
-      console.error('Gemini Interactions returned non-JSON response', responseText.slice(0, 2000));
-      return { raw: null, error: 'Gemini Interactions returned an invalid response.' };
-    }
-
-    const textBlocks = [];
-    if (typeof data?.output_text === 'string') textBlocks.push(data.output_text);
-    for (const step of data?.steps || []) {
-      if (step?.type !== 'model_output') continue;
-      for (const block of step?.content || []) {
-        if (block?.type === 'text' && typeof block?.text === 'string') textBlocks.push(block.text);
+      const parsed = cleanAndParseJson(response?.text || '');
+      if (parsed && typeof parsed === 'object') {
+        parsed.geminiModelUsed = model;
+        parsed.source = parsed.source || 'YouTube video';
+        return { raw: parsed, error: null };
       }
+      errors.push(`${model}: Gemini returned non-JSON output`);
+    } catch (e) {
+      const msg = e?.message || String(e);
+      console.warn('Direct YouTube Gemini call failed:', model, msg);
+      errors.push(`${model}: ${msg}`);
     }
-
-    const outputText = textBlocks.join('\n').trim();
-    const parsed = cleanAndParseJson(outputText);
-    if (!parsed) {
-      console.error('Gemini Interactions output could not be parsed', outputText.slice(0, 2000));
-      return { raw: null, error: 'Gemini returned a response that could not be parsed.' };
-    }
-
-    parsed.geminiModelUsed = data?.model || 'gemini-3.8-flash';
-    return { raw: parsed, error: null };
-  } catch (e) {
-    const message = e?.name === 'AbortError'
-      ? 'Gemini YouTube analysis timed out after 50 seconds.'
-      : (e?.message || String(e));
-    console.error('Gemini Interactions YouTube request failed', message);
-    return { raw: null, error: message };
-  } finally {
-    clearTimeout(timer);
   }
+  return { raw: null, error: errors.join(' | ').slice(0, 1800) || 'No YouTube model returned a result' };
+}
+
+async function fetchYouTubeThumbnailBase64(videoId) {
+  const candidates = [
+    `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+    `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+  ];
+  for (const url of candidates) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('image')) continue;
+      const bytes = Buffer.from(await res.arrayBuffer());
+      // Tiny placeholder images are not useful evidence.
+      if (bytes.length < 5000) continue;
+      return { data: bytes.toString('base64'), mimeType: contentType.split(';')[0] || 'image/jpeg', url };
+    } catch (e) {
+      console.warn('YouTube thumbnail fetch failed:', url, e?.message || e);
+    }
+  }
+  return null;
+}
+
+async function analyzeYouTubeThumbnail(videoId, meta, caption = '') {
+  if (!ai) return null;
+  const thumb = await fetchYouTubeThumbnailBase64(videoId);
+  if (!thumb) return null;
+
+  const textContext = [meta?.title, meta?.author, caption].filter(Boolean).join(' | ');
+  const prompt = `${DESTINATION_PROMPT_INSTRUCTIONS}\n\nThe full YouTube video could not be processed, so analyze the public video thumbnail plus its metadata. Do NOT claim you watched the full video.\nTitle/creator/caption: ${textContext || 'Unavailable'}\nUse visible thumbnail text, landmarks, architecture, geography and explicit title wording. If location is not supported, return blank geography with confidence below 35.`;
+
+  const raw = await generateStructured([
+    { inlineData: { data: thumb.data, mimeType: thumb.mimeType } },
+    { text: prompt },
+  ], 25000);
+  if (raw) {
+    raw.source = raw.source || 'YouTube thumbnail + title';
+    raw.thumbnailUrl = thumb.url;
+  }
+  return raw;
 }
 
 async function generateStructured(contents, timeoutMs = 30000) {
@@ -327,34 +336,58 @@ export async function analyzeLinkPayload(url, caption = '') {
     const meta = await fetchYouTubeMetadata(canonical);
     const prompt = `${DESTINATION_PROMPT_INSTRUCTIONS}\n\nYou are analyzing this public YouTube travel video.\nTitle: ${meta.title || caption || 'Unavailable'}\nCreator: ${meta.author || 'Unavailable'}\nInspect the actual video frames and audio. Return structured JSON only.`;
 
-    // Use the current Gemini Interactions API for direct public YouTube video input.
-    // This is the API path Google currently recommends for new multimodal projects.
-    const interactionResult = await analyzeYouTubeWithInteractions(canonical, prompt);
-    let raw = interactionResult.raw;
+    // 1) Primary: send the public YouTube URL directly to Gemini exactly as documented.
+    const directResult = await analyzeYouTubeDirect(canonical, prompt);
+    let raw = directResult.raw;
+    let usedFullVideo = Boolean(raw);
 
-    // Compatibility fallback for deployments where Interactions is temporarily unavailable.
-    // Keep this secondary; the Interactions call above is the primary path.
+    // 2) Fallback: if YouTube URL video processing is unavailable for this specific
+    // video/model/quota, analyze the public YouTube thumbnail + title instead of
+    // immediately failing the whole TripSpark flow.
     if (!raw) {
-      console.warn('Primary YouTube analysis failed; trying generateContent compatibility path:', interactionResult.error);
-      raw = await generateStructured([
-        { fileData: { fileUri: canonical } },
-        { text: prompt },
-      ], 42000);
+      console.warn('Full YouTube analysis failed; trying thumbnail + metadata fallback:', directResult.error);
+      raw = await analyzeYouTubeThumbnail(videoId, meta, caption);
+      usedFullVideo = false;
     }
 
-    if (raw) {
-      const analysis = normalizeAnalysis(raw, { inputSource: 'youtube_url', inputUrl: canonical, actualMediaAvailable: true, sourceFallback: 'YouTube video' });
-      return { status: 200, body: { success: true, platform: 'YouTube', normalisedUrl: canonical, actualMediaAvailable: true, contentAccessStatus: 'visual_analyzed', analysis, mediaRestricted: false } };
+    // 3) Last safe fallback: explicit title/caption location cues only. Never invent a city.
+    if (!raw) raw = heuristicFromText([meta.title, caption].filter(Boolean).join(' | '));
+
+    if (raw && (raw.country || raw.region_or_state || raw.city_or_destination || Number(raw.confidence || 0) >= 35)) {
+      const analysis = normalizeAnalysis(raw, {
+        inputSource: 'youtube_url',
+        inputUrl: canonical,
+        actualMediaAvailable: usedFullVideo,
+        sourceFallback: usedFullVideo ? 'YouTube video' : 'YouTube thumbnail/title',
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          platform: 'YouTube',
+          normalisedUrl: canonical,
+          actualMediaAvailable: usedFullVideo,
+          contentAccessStatus: usedFullVideo ? 'visual_analyzed' : 'thumbnail_or_text_analyzed',
+          analysis,
+          mediaRestricted: false,
+          analysisMethod: usedFullVideo ? 'youtube_video' : 'youtube_thumbnail_or_text',
+        },
+      };
     }
 
-    // Safer fallback: use title only, never a default destination.
-    const fallback = heuristicFromText(meta.title || caption || '');
-    if (fallback.confidence >= 45) {
-      const analysis = normalizeAnalysis(fallback, { inputSource: 'youtube_url', inputUrl: canonical, actualMediaAvailable: false, sourceFallback: 'YouTube title' });
-      return { status: 200, body: { success: true, platform: 'YouTube', normalisedUrl: canonical, actualMediaAvailable: false, contentAccessStatus: 'text_only', analysis, mediaRestricted: false } };
-    }
-
-    return { status: 200, body: { success: false, platform: 'YouTube', normalisedUrl: canonical, actualMediaAvailable: false, contentAccessStatus: 'unaccessible', mediaRestricted: true, message: 'We could read the YouTube link, but Gemini could not complete visual analysis for this video. Try again once, or upload a screenshot/video.', debugReason: interactionResult.error || 'No structured visual result returned' } };
+    return {
+      status: 200,
+      body: {
+        success: false,
+        platform: 'YouTube',
+        normalisedUrl: canonical,
+        actualMediaAvailable: false,
+        contentAccessStatus: 'unaccessible',
+        mediaRestricted: true,
+        message: 'TripSpark could open this YouTube link, but there was not enough reliable visual or text evidence to identify the destination. Try another public Short or upload a screenshot.',
+        debugReason: directResult.error || 'No reliable video, thumbnail, or title result',
+      },
+    };
   }
 
   // Instagram/TikTok cannot reliably expose full video frames from a pasted link alone.
