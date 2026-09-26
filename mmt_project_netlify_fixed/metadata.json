@@ -1,0 +1,6 @@
+{
+  "name": "MMT TripSpark",
+  "description": "See it. Plan it. Book it. Turn social travel inspiration into personalized, bookable MakeMyTrip packages.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
