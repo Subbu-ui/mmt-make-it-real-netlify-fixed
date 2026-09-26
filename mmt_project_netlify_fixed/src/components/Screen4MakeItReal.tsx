@@ -274,6 +274,43 @@ function resolveVibeAlternative(
   };
 }
 
+function ensureDistinctSameCountryAlternative(
+  exactDestination: string,
+  sourceCountry: string | null | undefined,
+  alternative: VibeAlternative
+): VibeAlternative {
+  const norm = (value: string) =>
+    value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+  if (norm(alternative.name) !== norm(exactDestination)) return alternative;
+
+  const country = (sourceCountry || '').toLowerCase();
+  const sameCountryFallbacks: Record<string, string[]> = {
+    india: ['Udaipur', 'Varkala', 'Manali', 'Gokarna', 'Jodhpur'],
+    indonesia: ['Lombok', 'Yogyakarta', 'Nusa Penida'],
+    'south korea': ['Busan', 'Jeju Island', 'Gyeongju'],
+    korea: ['Busan', 'Jeju Island', 'Gyeongju'],
+    france: ['Nice', 'Bordeaux', 'Lyon'],
+    thailand: ['Krabi', 'Chiang Mai', 'Koh Samui'],
+    vietnam: ['Hoi An', 'Da Nang', 'Nha Trang'],
+    malaysia: ['George Town (Penang)', 'Langkawi', 'Kuala Lumpur'],
+    japan: ['Kyoto', 'Kanazawa', 'Osaka'],
+    italy: ['Florence', 'Verona', 'Bologna'],
+    spain: ['Valencia', 'Seville', 'Granada'],
+    switzerland: ['Lucerne', 'Interlaken', 'Zermatt'],
+    'united arab emirates': ['Abu Dhabi', 'Ras Al Khaimah', 'Dubai'],
+    uae: ['Abu Dhabi', 'Ras Al Khaimah', 'Dubai'],
+    singapore: ['Sentosa Island', 'Marina Bay', 'Katong'],
+  };
+
+  const key = Object.keys(sameCountryFallbacks).find((k) => country.includes(k));
+  const candidates = key ? sameCountryFallbacks[key] : [];
+  const replacement = candidates.find((name) => norm(name) !== norm(exactDestination));
+
+  if (!replacement) return alternative;
+  return { ...alternative, name: replacement, stayText: `${replacement} Boutique Experience Stay` };
+}
+
 export const Screen4MakeItReal: React.FC<Screen4MakeItRealProps> = ({
   analysis,
   destination,
@@ -287,7 +324,11 @@ export const Screen4MakeItReal: React.FC<Screen4MakeItRealProps> = ({
 
   // GUARANTEED DISTINCT ALTERNATIVE DESTINATION FOR "SAME VIBE"
   const sourceCountry = analysis?.country || analysis?.location?.country || null;
-  const vibeAlternative = resolveVibeAlternative(destName, sourceCountry, analysis?.travelVibes);
+  const vibeAlternative = ensureDistinctSameCountryAlternative(
+    destName,
+    sourceCountry,
+    resolveVibeAlternative(destName, sourceCountry, analysis?.travelVibes)
+  );
 
   // Tailored 3-way feasibility data based on detected destination
   let options: FeasibilityOption[] = [];

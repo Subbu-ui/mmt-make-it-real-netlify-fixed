@@ -309,6 +309,151 @@ function normalizeAnalysis(raw, { inputSource, inputUrl, actualMediaAvailable, s
   };
 }
 
+
+
+function decodeHtmlEntities(value = '') {
+  return String(value)
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#x2F;/gi, '/')
+    .replace(/&#x3D;/gi, '=')
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#(\d+);/g, (_, n) => {
+      try { return String.fromCharCode(Number(n)); } catch { return _; }
+    });
+}
+
+function extractMetaContent(html, key) {
+  if (!html) return '';
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, 'i'),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${escaped}["'][^>]*>`, 'i'),
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m?.[1]) return decodeHtmlEntities(m[1].trim());
+  }
+  return '';
+}
+
+function extractHtmlTitle(html) {
+  const m = String(html || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return m?.[1] ? decodeHtmlEntities(m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()) : '';
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchPublicSocialMetadata(rawUrl, platform) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+  };
+
+  const attempts = [rawUrl];
+  if (platform === 'Instagram') {
+    try {
+      const u = new URL(rawUrl);
+      const parts = u.pathname.split('/').filter(Boolean);
+      const kindIndex = parts.findIndex((x) => ['reel', 'reels', 'p', 'tv'].includes(x.toLowerCase()));
+      if (kindIndex >= 0 && parts[kindIndex + 1]) {
+        attempts.push(`https://www.instagram.com/${parts[kindIndex]}/${parts[kindIndex + 1]}/embed/captioned/`);
+      }
+    } catch {}
+  }
+
+  let lastStatus = null;
+  for (const url of attempts) {
+    try {
+      const res = await fetchWithTimeout(url, { headers, redirect: 'follow' }, 9000);
+      lastStatus = res.status;
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (!html || html.length < 200) continue;
+
+      const title = extractMetaContent(html, 'og:title') || extractMetaContent(html, 'twitter:title') || extractHtmlTitle(html);
+      const description = extractMetaContent(html, 'og:description') || extractMetaContent(html, 'twitter:description') || extractMetaContent(html, 'description');
+      const imageUrl = extractMetaContent(html, 'og:image') || extractMetaContent(html, 'twitter:image');
+      const canonical = extractMetaContent(html, 'og:url') || rawUrl;
+      const videoUrl = extractMetaContent(html, 'og:video:secure_url') || extractMetaContent(html, 'og:video') || '';
+
+      if (title || description || imageUrl || videoUrl) {
+        return { ok: true, title, description, imageUrl, videoUrl, canonical, fetchedFrom: url, status: res.status };
+      }
+    } catch (e) {
+      console.warn(`${platform} metadata fetch failed:`, url, e?.message || e);
+    }
+  }
+  return { ok: false, title: '', description: '', imageUrl: '', videoUrl: '', canonical: rawUrl, status: lastStatus };
+}
+
+async function fetchImageAsBase64(imageUrl) {
+  if (!imageUrl) return null;
+  try {
+    const res = await fetchWithTimeout(imageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/129 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Referer': 'https://www.instagram.com/',
+      },
+      redirect: 'follow',
+    }, 10000);
+    if (!res.ok) return null;
+    const contentType = (res.headers.get('content-type') || '').split(';')[0];
+    if (!contentType.startsWith('image/')) return null;
+    const bytes = Buffer.from(await res.arrayBuffer());
+    if (bytes.length < 1500 || bytes.length > 8_000_000) return null;
+    return { data: bytes.toString('base64'), mimeType: contentType || 'image/jpeg' };
+  } catch (e) {
+    console.warn('Social preview image fetch failed:', e?.message || e);
+    return null;
+  }
+}
+
+async function analyzePublicSocialPreview(rawUrl, platform, caption = '') {
+  const meta = await fetchPublicSocialMetadata(rawUrl, platform);
+  const textContext = [caption, meta.title, meta.description].filter(Boolean).join(' | ');
+  const image = meta.imageUrl ? await fetchImageAsBase64(meta.imageUrl) : null;
+
+  if (image) {
+    const prompt = `${DESTINATION_PROMPT_INSTRUCTIONS}\n\nYou are analyzing a PUBLIC ${platform} post/reel preview, not the full private video stream. Use the supplied public preview image plus any public caption/title/description. Never claim you watched the full reel.\nPublic text: ${textContext || 'Unavailable'}\nIf the image/text does not support a location, leave geography blank and confidence below 35.`;
+    const raw = await generateStructured([
+      { inlineData: { data: image.data, mimeType: image.mimeType } },
+      { text: prompt },
+    ], 26000);
+    if (raw) {
+      raw.source = raw.source || `${platform} public preview + post text`;
+      return { raw, meta, usedImage: true };
+    }
+  }
+
+  if (textContext) {
+    let raw = await generateStructured([
+      { text: `${DESTINATION_PROMPT_INSTRUCTIONS}\n\nOnly public ${platform} post text/metadata is available; do not pretend to see the video.\n${textContext}` },
+    ], 22000);
+    raw ||= heuristicFromText(textContext);
+    if (raw) {
+      raw.source = raw.source || `${platform} public post text`;
+      return { raw, meta, usedImage: false };
+    }
+  }
+
+  return { raw: null, meta, usedImage: false };
+}
+
 export async function analyzeLinkPayload(url, caption = '') {
   const trimmedUrl = String(url || '').trim();
   if (!trimmedUrl) return { status: 400, body: { success: false, error: 'URL is required' } };
@@ -390,23 +535,53 @@ export async function analyzeLinkPayload(url, caption = '') {
     };
   }
 
-  // Instagram/TikTok cannot reliably expose full video frames from a pasted link alone.
-  // Use explicit caption/title hints only when provided; otherwise request media upload rather than hallucinating.
+  // Instagram/TikTok: first try PUBLIC Open Graph / embed preview metadata (caption, title, thumbnail).
+  // This does not bypass platform privacy and does not claim to read the full video stream.
   if (isInstagram || isTikTok) {
-    let textHint = caption || '';
-    try {
-      const parsed = new URL(trimmedUrl);
-      textHint ||= parsed.searchParams.get('caption') || parsed.searchParams.get('title') || '';
-    } catch {}
-    if (textHint) {
-      let raw = await generateStructured(`${DESTINATION_PROMPT_INSTRUCTIONS}\n\nOnly post text is available. Analyze this text without pretending to see the video:\n${textHint}`);
-      raw ||= heuristicFromText(textHint);
-      if ((raw?.confidence || 0) >= 45 && (raw.country || raw.city_or_destination)) {
-        const analysis = normalizeAnalysis(raw, { inputSource: isInstagram ? 'instagram_reel' : 'tiktok_url', inputUrl: trimmedUrl, actualMediaAvailable: false, sourceFallback: 'Post text' });
-        return { status: 200, body: { success: true, platform: isInstagram ? 'Instagram' : 'TikTok', normalisedUrl: trimmedUrl, actualMediaAvailable: false, contentAccessStatus: 'text_only', analysis, mediaRestricted: false } };
-      }
+    const platform = isInstagram ? 'Instagram' : 'TikTok';
+    const preview = await analyzePublicSocialPreview(trimmedUrl, platform, caption);
+    const raw = preview.raw;
+
+    if (raw && (Number(raw.confidence || 0) >= 35) && (raw.country || raw.region_or_state || raw.city_or_destination)) {
+      const analysis = normalizeAnalysis(raw, {
+        inputSource: isInstagram ? 'instagram_reel' : 'tiktok_url',
+        inputUrl: preview.meta?.canonical || trimmedUrl,
+        actualMediaAvailable: Boolean(preview.usedImage),
+        sourceFallback: preview.usedImage ? `${platform} public preview image + text` : `${platform} public post text`,
+      });
+      analysis.contentAccessStatus = preview.usedImage ? 'visual_analyzed' : 'text_only';
+      analysis.sourceOfInference = preview.usedImage ? 'public_preview_image' : 'post_text';
+      return {
+        status: 200,
+        body: {
+          success: true,
+          platform,
+          normalisedUrl: preview.meta?.canonical || trimmedUrl,
+          actualMediaAvailable: Boolean(preview.usedImage),
+          contentAccessStatus: preview.usedImage ? 'public_preview_analyzed' : 'text_only',
+          analysis,
+          mediaRestricted: false,
+          analysisMethod: preview.usedImage ? 'public_preview_image_plus_metadata' : 'public_metadata_text',
+          thumbnailUrl: preview.meta?.imageUrl || null,
+          pageTitle: preview.meta?.title || null,
+          description: preview.meta?.description || null,
+        },
+      };
     }
-    return { status: 200, body: { success: false, platform: isInstagram ? 'Instagram' : 'TikTok', normalisedUrl: trimmedUrl, actualMediaAvailable: false, contentAccessStatus: 'unaccessible', mediaRestricted: true, message: 'We could access the link, but not enough visual content to identify the location. Upload a screenshot or short video clip.' } };
+
+    return {
+      status: 200,
+      body: {
+        success: false,
+        platform,
+        normalisedUrl: preview.meta?.canonical || trimmedUrl,
+        actualMediaAvailable: false,
+        contentAccessStatus: 'unaccessible',
+        mediaRestricted: true,
+        message: `TripSpark could open this public ${platform} link, but ${platform} did not expose enough public preview text/image evidence to identify the location. Upload a screenshot or short video clip for full visual analysis.`,
+        debugReason: preview.meta?.status ? `${platform} public page status ${preview.meta.status}; title=${Boolean(preview.meta.title)} description=${Boolean(preview.meta.description)} image=${Boolean(preview.meta.imageUrl)}` : `${platform} public metadata unavailable`,
+      },
+    };
   }
 
   return { status: 200, body: { success: false, platform: 'Web', normalisedUrl: trimmedUrl, actualMediaAvailable: false, contentAccessStatus: 'unaccessible', mediaRestricted: true, message: 'This link type is not directly supported. Upload a screenshot or video clip.' } };
