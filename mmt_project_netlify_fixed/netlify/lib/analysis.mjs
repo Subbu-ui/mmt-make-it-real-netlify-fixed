@@ -27,6 +27,31 @@ const destinationAnalysisSchema = {
   required: ['confidence', 'evidence', 'travelVibes', 'activities', 'summary'],
 };
 
+
+// Plain JSON Schema for the Gemini Interactions API. This is intentionally
+// separate from the @google/genai Type-based schema used by generateContent.
+const destinationAnalysisJsonSchema = {
+  type: 'object',
+  properties: {
+    country: { type: 'string' },
+    region_or_state: { type: 'string' },
+    city_or_destination: { type: 'string' },
+    specific_place: { type: 'string' },
+    displayName: { type: 'string' },
+    confidence: { type: 'number' },
+    evidence: { type: 'array', items: { type: 'string' } },
+    source: { type: 'string' },
+    travelVibes: { type: 'array', items: { type: 'string' } },
+    experience_tags: { type: 'array', items: { type: 'string' } },
+    landmarks: { type: 'array', items: { type: 'string' } },
+    activities: { type: 'array', items: { type: 'string' } },
+    visualHighlights: { type: 'array', items: { type: 'string' } },
+    accommodationStyle: { type: 'string' },
+    summary: { type: 'string' },
+  },
+  required: ['country', 'region_or_state', 'city_or_destination', 'specific_place', 'displayName', 'confidence', 'evidence', 'source', 'travelVibes', 'experience_tags', 'landmarks', 'activities', 'visualHighlights', 'accommodationStyle', 'summary'],
+};
+
 const DESTINATION_PROMPT_INSTRUCTIONS = `You are MakeMyTrip's TripSpark destination and experience detection engine.
 
 Determine location from the supplied travel content. Use this evidence order:
@@ -138,7 +163,80 @@ function heuristicFromText(textHint = '') {
   };
 }
 
-async function generateStructured(contents) {
+async function analyzeYouTubeWithInteractions(videoUrl, prompt) {
+  if (!apiKey) return { raw: null, error: 'Missing GEMINI_API_KEY' };
+
+  const controller = new AbortController();
+  // YouTube video understanding can take longer than a normal text request.
+  // Netlify synchronous functions allow up to 60s, so give Gemini 50s.
+  const timer = setTimeout(() => controller.abort(), 50000);
+
+  try {
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        model: 'gemini-3.8-flash',
+        store: false,
+        input: [
+          { type: 'video', uri: videoUrl },
+          { type: 'text', text: prompt },
+        ],
+        response_format: {
+          type: 'text',
+          mime_type: 'application/json',
+          schema: destinationAnalysisJsonSchema,
+        },
+      }),
+    });
+
+    const responseText = await res.text();
+    if (!res.ok) {
+      console.error('Gemini Interactions YouTube error', res.status, responseText.slice(0, 2000));
+      return { raw: null, error: `Gemini Interactions API ${res.status}: ${responseText.slice(0, 500)}` };
+    }
+
+    let data;
+    try { data = JSON.parse(responseText); }
+    catch {
+      console.error('Gemini Interactions returned non-JSON response', responseText.slice(0, 2000));
+      return { raw: null, error: 'Gemini Interactions returned an invalid response.' };
+    }
+
+    const textBlocks = [];
+    if (typeof data?.output_text === 'string') textBlocks.push(data.output_text);
+    for (const step of data?.steps || []) {
+      if (step?.type !== 'model_output') continue;
+      for (const block of step?.content || []) {
+        if (block?.type === 'text' && typeof block?.text === 'string') textBlocks.push(block.text);
+      }
+    }
+
+    const outputText = textBlocks.join('\n').trim();
+    const parsed = cleanAndParseJson(outputText);
+    if (!parsed) {
+      console.error('Gemini Interactions output could not be parsed', outputText.slice(0, 2000));
+      return { raw: null, error: 'Gemini returned a response that could not be parsed.' };
+    }
+
+    parsed.geminiModelUsed = data?.model || 'gemini-3.8-flash';
+    return { raw: parsed, error: null };
+  } catch (e) {
+    const message = e?.name === 'AbortError'
+      ? 'Gemini YouTube analysis timed out after 50 seconds.'
+      : (e?.message || String(e));
+    console.error('Gemini Interactions YouTube request failed', message);
+    return { raw: null, error: message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function generateStructured(contents, timeoutMs = 30000) {
   if (!ai) return null;
   for (const model of CANDIDATE_MODELS) {
     try {
@@ -149,7 +247,7 @@ async function generateStructured(contents) {
       });
       const response = await Promise.race([
         work,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout')), 18000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Gemini timeout')), timeoutMs)),
       ]);
       const parsed = cleanAndParseJson(response?.text || '');
       if (parsed && typeof parsed === 'object') {
@@ -229,11 +327,20 @@ export async function analyzeLinkPayload(url, caption = '') {
     const meta = await fetchYouTubeMetadata(canonical);
     const prompt = `${DESTINATION_PROMPT_INSTRUCTIONS}\n\nYou are analyzing this public YouTube travel video.\nTitle: ${meta.title || caption || 'Unavailable'}\nCreator: ${meta.author || 'Unavailable'}\nInspect the actual video frames and audio. Return structured JSON only.`;
 
-    // Official Gemini YouTube URL input: public YouTube URL as fileData.fileUri.
-    const raw = await generateStructured([
-      { fileData: { fileUri: canonical } },
-      { text: prompt },
-    ]);
+    // Use the current Gemini Interactions API for direct public YouTube video input.
+    // This is the API path Google currently recommends for new multimodal projects.
+    const interactionResult = await analyzeYouTubeWithInteractions(canonical, prompt);
+    let raw = interactionResult.raw;
+
+    // Compatibility fallback for deployments where Interactions is temporarily unavailable.
+    // Keep this secondary; the Interactions call above is the primary path.
+    if (!raw) {
+      console.warn('Primary YouTube analysis failed; trying generateContent compatibility path:', interactionResult.error);
+      raw = await generateStructured([
+        { fileData: { fileUri: canonical } },
+        { text: prompt },
+      ], 42000);
+    }
 
     if (raw) {
       const analysis = normalizeAnalysis(raw, { inputSource: 'youtube_url', inputUrl: canonical, actualMediaAvailable: true, sourceFallback: 'YouTube video' });
@@ -247,7 +354,7 @@ export async function analyzeLinkPayload(url, caption = '') {
       return { status: 200, body: { success: true, platform: 'YouTube', normalisedUrl: canonical, actualMediaAvailable: false, contentAccessStatus: 'text_only', analysis, mediaRestricted: false } };
     }
 
-    return { status: 200, body: { success: false, platform: 'YouTube', normalisedUrl: canonical, actualMediaAvailable: false, contentAccessStatus: 'unaccessible', mediaRestricted: true, message: 'We could read the YouTube link, but could not confidently detect the location. Try another public video or upload a screenshot.' } };
+    return { status: 200, body: { success: false, platform: 'YouTube', normalisedUrl: canonical, actualMediaAvailable: false, contentAccessStatus: 'unaccessible', mediaRestricted: true, message: 'We could read the YouTube link, but Gemini could not complete visual analysis for this video. Try again once, or upload a screenshot/video.', debugReason: interactionResult.error || 'No structured visual result returned' } };
   }
 
   // Instagram/TikTok cannot reliably expose full video frames from a pasted link alone.
