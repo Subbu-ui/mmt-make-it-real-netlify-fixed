@@ -44,7 +44,7 @@ export function normalizeSocialUrl(rawUrl: string): {
         contentType = 'Post';
         contentId = pathParts[1] || '';
       }
-      const canonicalPath = contentId ? `/${pathParts[0]}/${contentId}/` : urlObj.pathname;
+      const canonicalPath = contentId ? `/reel/${contentId}/` : urlObj.pathname;
       return {
         valid: true,
         platform: 'Instagram',
@@ -112,24 +112,29 @@ export async function analyzeUrlWithServer(url: string): Promise<{
     }
 
     const data = await res.json();
+    const isSuccess = Boolean(data.success);
+    const analysisObj = data.aiAnalysis || data.analysis;
+    const hasVisual = Boolean(data.actualMediaAvailable || (analysisObj && data.contentAccessStatus !== 'unaccessible'));
+    const hasText = Boolean(data.hasUsefulTextEvidence || (analysisObj?.evidence && analysisObj.evidence.length > 0) || data.description);
+
     return {
-      success: true,
+      success: isSuccess,
       evidence: {
-        sourceUrl: data.sourceUrl,
-        normalisedUrl: data.normalisedUrl,
-        platform: data.platform,
-        contentType: data.contentType,
-        contentId: data.contentId,
-        captionText: data.captionText,
+        sourceUrl: data.sourceUrl || url,
+        normalisedUrl: data.normalisedUrl || url,
+        platform: data.platform || 'Instagram',
+        contentType: data.contentType || 'Reel',
+        contentId: data.contentId || '',
+        captionText: data.captionText || data.description,
         pageTitle: data.pageTitle,
         description: data.description,
         thumbnailUrl: data.thumbnailUrl,
-        hasUsefulTextEvidence: data.hasUsefulTextEvidence,
-        hasUsefulVisualEvidence: data.hasUsefulVisualEvidence,
-        mediaRestricted: data.mediaRestricted,
+        hasUsefulTextEvidence: hasText,
+        hasUsefulVisualEvidence: hasVisual,
+        mediaRestricted: data.mediaRestricted ?? !isSuccess,
       },
-      aiAnalysis: data.aiAnalysis,
-      mediaRestricted: data.mediaRestricted,
+      aiAnalysis: analysisObj,
+      mediaRestricted: data.mediaRestricted ?? !isSuccess,
       message: data.message,
     };
   } catch (error: any) {

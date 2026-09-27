@@ -151,6 +151,13 @@ export const Screen3Understand: React.FC<Screen3UnderstandProps> = ({
       initialDisplayName = cleanCity;
     } else if (cleanCountry) {
       initialDisplayName = cleanCountry;
+    } else if (
+      analysis?.destination &&
+      analysis.destination !== 'Destination' &&
+      analysis.destination !== 'Scenic Region' &&
+      analysis.destination !== 'Global'
+    ) {
+      initialDisplayName = analysis.destination;
     }
   }
 
@@ -207,6 +214,12 @@ export const Screen3Understand: React.FC<Screen3UnderstandProps> = ({
   const [customDestinationInput, setCustomDestinationInput] = useState('');
   const [showEvidence, setShowEvidence] = useState(false);
   const [isVibeOnly, setIsVibeOnly] = useState(false);
+
+  useEffect(() => {
+    if (location.displayName) {
+      setCurrentDisplayName(location.displayName);
+    }
+  }, [location.displayName]);
 
   const handleSaveCustomDestination = (name: string) => {
     const trimmed = name.trim();

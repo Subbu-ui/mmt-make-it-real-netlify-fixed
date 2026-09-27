@@ -1,5 +1,5 @@
 export type TravellerType = 'solo' | 'couple' | 'friends' | 'family';
-export type BudgetMode = 'per_person' | 'total_trip';
+export type BudgetMode = 'per_person' | 'total_trip' | 'total';
 export type DateFlexibility = 'exact' | 'flexible_3' | 'flexible_month';
 export type TravelPreference = 'flight' | 'train' | 'bus' | 'road' | 'cheapest' | 'fastest' | 'mmt_optimise';
 export type StrategyType = 'recreate' | 'budget' | 'vibe';
@@ -69,6 +69,7 @@ export interface TripStrategyOption {
   transferType: string;
   experienceLevel: string;
   heroImage: string;
+  imageUrl?: string;
   whatStayed: string[];
   whatChanged: string[];
 }
@@ -155,6 +156,11 @@ export type InspirationSource =
   | {
       type: 'WEB_URL';
       url: string;
+    }
+  | {
+      type: 'URL';
+      url: string;
+      platform?: string;
     }
   | {
       type: 'UPLOADED_IMAGE';
@@ -274,7 +280,11 @@ export type ImagePipelineStep =
   | 'PARSING_RESULT'
   | 'SUCCESS'
   | 'NEEDS_CONFIRMATION'
-  | 'FAILED';
+  | 'FAILED'
+  | 'STEP_1_UPLOAD_MEDIA'
+  | 'STEP_2_EXTRACT_TEXT'
+  | 'STEP_3_IDENTIFY_LANDMARKS'
+  | 'STEP_4_CONFIRM_DESTINATION';
 
 export type AnalysisState =
   | 'IDLE'
@@ -295,7 +305,7 @@ export type AnalysisState =
   | 'ANALYSIS_FAILED';
 
 export interface TripSession {
-  sourceType: 'DEMO' | 'INSTAGRAM_URL' | 'YOUTUBE_URL' | 'WEB_URL' | 'UPLOADED_IMAGE' | 'UPLOADED_VIDEO';
+  sourceType: 'DEMO' | 'INSTAGRAM_URL' | 'INSTAGRAM_REEL' | 'YOUTUBE_URL' | 'WEB_URL' | 'UPLOADED_IMAGE' | 'UPLOADED_VIDEO';
   sourceUrl: string;
   normalisedUrl?: string;
   platform: string;
@@ -439,6 +449,7 @@ export interface CurrentTripState {
     url?: string;
     imagePreview?: string;
     analysis?: VideoAnalysisResult;
+    title?: string;
   } | null;
   detectedDestination: string;
   selectedDestination: string;
